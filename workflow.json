@@ -1,0 +1,181 @@
+{
+  "name": "Facturas a Google Sheets con IA",
+  "nodes": [
+    {
+      "id": "885c6e06-5cfb-4468-b274-bd0a200c3af1",
+      "name": "Formulario: subir factura",
+      "type": "n8n-nodes-base.formTrigger",
+      "typeVersion": 2.2,
+      "position": [
+        0,
+        0
+      ],
+      "webhookId": "32e205ef-7a0a-4c2e-ba12-f32da3ecba85",
+      "parameters": {
+        "formTitle": "Subir factura",
+        "formDescription": "Sube la foto o el PDF de una factura o boleta. Los datos se agregan a la planilla automáticamente.",
+        "formFields": {
+          "values": [
+            {
+              "fieldLabel": "Factura",
+              "fieldType": "file",
+              "requiredField": true,
+              "multipleFiles": false,
+              "acceptFileTypes": ".jpg,.jpeg,.png,.webp,.pdf"
+            }
+          ]
+        },
+        "responseMode": "onReceived",
+        "options": {
+          "respondWithOptions": {
+            "values": {
+              "formSubmittedText": "Recibimos el documento. En unos segundos aparecerá en la planilla."
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "9dd5422a-338b-4b34-826e-eac022f029e0",
+      "name": "Preparar archivo",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        0
+      ],
+      "parameters": {
+        "jsCode": "// Toma el archivo subido en el formulario y arma la petición para la API de Claude.\nconst PROMPT = \"Eres un asistente que lee documentos tributarios chilenos (facturas, boletas, notas de crédito).\\nLee el documento adjunto y responde SOLO con un objeto JSON, sin texto adicional, con estas claves:\\n{\\\"tipo\\\": \\\"factura\\\" | \\\"boleta\\\" | \\\"nota_credito\\\" | \\\"otro\\\", \\\"emisor\\\": razón social del emisor, \\\"rut_emisor\\\": RUT del emisor tal como aparece, \\\"folio\\\": número del documento como texto, \\\"fecha\\\": fecha de emisión AAAA-MM-DD, \\\"neto\\\": número entero o null, \\\"iva\\\": número entero o null, \\\"exento\\\": número entero o null, \\\"total\\\": número entero}\\nCopia los montos exactamente como están impresos, aunque no cuadren. Si un dato no se lee, usa null.\";\nconst MODELO = 'claude-sonnet-5-5'; // cámbialo por 'claude-haiku-5-5' para gastar menos\n\nconst item = $input.first();\nconst clave = Object.keys(item.binary || {})[0];\nif (!clave) throw new Error('El formulario no trajo ningún archivo.');\nconst archivo = item.binary[clave];\nconst buffer = await this.helpers.getBinaryDataBuffer(0, clave);\nif (buffer.length > 5 * 1024 * 1024) throw new Error('El archivo pesa más de 5 MB. Sube una foto más liviana.');\nconst base64 = buffer.toString('base64');\n\nconst esPdf = archivo.mimeType === 'application/pdf';\nconst bloque = esPdf\n  ? { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: base64 } }\n  : { type: 'image', source: { type: 'base64', media_type: archivo.mimeType, data: base64 } };\n\nreturn [{\n  json: {\n    archivo: archivo.fileName,\n    body: { model: MODELO, max_tokens: 800, messages: [{ role: 'user', content: [bloque, { type: 'text', text: PROMPT }] }] },\n  },\n}];"
+      }
+    },
+    {
+      "id": "f8d3ee2b-49e9-4231-b759-9ab91385082b",
+      "name": "Claude: leer documento",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        480,
+        0
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.body) }}",
+        "options": {
+          "timeout": 120000
+        }
+      }
+    },
+    {
+      "id": "df6446b1-8756-49c6-b6b0-1d1a27b7aab8",
+      "name": "Validar datos",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        720,
+        0
+      ],
+      "parameters": {
+        "jsCode": "// Lee la respuesta de Claude y valida el documento con reglas fijas (sin IA).\nconst respuesta = $input.first().json;\nconst texto = (respuesta.content || []).map((c) => c.text || '').join('');\nconst ini = texto.indexOf('{'), fin = texto.lastIndexOf('}');\nif (ini < 0 || fin < ini) throw new Error('Claude no devolvió un JSON legible: ' + texto.slice(0, 200));\nconst d = JSON.parse(texto.slice(ini, fin + 1));\n\nconst num = (x) => {\n  if (typeof x === 'number') return x;\n  if (x == null || x === '') return null;\n  const n = parseFloat(String(x).replace(/[$\\s.]/g, '').replace(',', '.'));\n  return isNaN(n) ? null : n;\n};\nconst limpiarRut = (r) => String(r || '').toUpperCase().replace(/[^0-9K]/g, '');\nconst dv = (cuerpo) => {\n  let suma = 0, mult = 2;\n  for (const c of String(cuerpo).split('').reverse()) { suma += Number(c) * mult; mult = mult === 7 ? 2 : mult + 1; }\n  const r = 11 - (suma % 11);\n  return r === 11 ? '0' : r === 10 ? 'K' : String(r);\n};\n\nconst obs = [];\nconst neto = num(d.neto), iva = num(d.iva), exento = num(d.exento) || 0, total = num(d.total);\nfor (const [k, nombre] of [['emisor', 'emisor'], ['rut_emisor', 'RUT'], ['folio', 'folio'], ['fecha', 'fecha'], ['total', 'total']])\n  if (d[k] == null || d[k] === '') obs.push('Falta ' + nombre);\nconst rut = limpiarRut(d.rut_emisor);\nif (rut.length > 1 && dv(rut.slice(0, -1)) !== rut.slice(-1)) obs.push('RUT con dígito verificador incorrecto');\nif (d.tipo === 'factura' && neto != null && iva != null && Math.abs(Math.round(neto * 0.19) - iva) > 2)\n  obs.push('IVA no es el 19% del neto (debería ser ' + Math.round(neto * 0.19) + ')');\nif (neto != null && total != null && Math.abs(neto + (iva || 0) + exento - total) > 2)\n  obs.push('El total no cuadra con neto + IVA + exento');\n\nreturn [{\n  json: {\n    fecha_carga: typeof $now !== 'undefined' ? $now.toISODate() : new Date().toISOString().slice(0, 10),\n    archivo: $('Preparar archivo').first().json.archivo,\n    tipo: d.tipo, emisor: d.emisor, rut_emisor: d.rut_emisor, folio: d.folio, fecha: d.fecha,\n    neto, iva, exento: num(d.exento), total,\n    estado: obs.length ? 'REVISAR' : 'OK',\n    observaciones: obs.join(' | '),\n  },\n}];"
+      }
+    },
+    {
+      "id": "678fd074-5ab2-4c91-857f-7f5ff58d1984",
+      "name": "Agregar a Google Sheets",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        960,
+        0
+      ],
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "mode": "url",
+          "value": ""
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "Facturas"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {}
+      }
+    }
+  ],
+  "connections": {
+    "Formulario: subir factura": {
+      "main": [
+        [
+          {
+            "node": "Preparar archivo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Preparar archivo": {
+      "main": [
+        [
+          {
+            "node": "Claude: leer documento",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claude: leer documento": {
+      "main": [
+        [
+          {
+            "node": "Validar datos",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validar datos": {
+      "main": [
+        [
+          {
+            "node": "Agregar a Google Sheets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": false,
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": []
+}
